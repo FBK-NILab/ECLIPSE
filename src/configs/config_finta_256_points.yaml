@@ -1,0 +1,70 @@
+checkpoint_path: 'checkpoints'
+img_path: 'imgs'
+embedding_path: 'embeddings'
+mode: 'train'
+deterministic: y
+benchmark: n
+fixed_seed: y
+seed: 42
+continue_train: n
+print_summary: n
+error_vs_length_test_streamline_number: 1000
+embedding_vs_real_distance_test_streamline_number: 100
+resample_loss_points_number: 200
+cmap_name: 'viridis'
+use_chamfer: n
+
+epochs: 100
+device_ids: [0]
+
+data:
+    name: 'BilGin'
+    base_path: '/home/nilab/data/'
+    streamline_number: 1000
+    padding: n
+    plausible_only: y
+    non_plausible_only: n
+    rescale: n
+    max_streamline_length: 256  # It is actually 250, but we chose 256 to uniform with the version of FINTA with resampling
+    return_geometric: n
+    pattern: 'det'
+    use_sublist: y
+
+dataloader:
+    batch_size: 2
+    pin_memory: y
+    drop_last: n
+    shuffle_train: y
+    num_workers: 2
+    timeout: 0
+    persistent_workers: y
+    prefetch_factor: 2
+
+optimizer:
+    name: 'adam'
+    lr: 0.00068  # learning rate used in the paper of FINTA
+    weight_decay: 0
+    fused: y
+
+scheduler:
+    T_max: 1000000
+    eta_min: 0
+    last_epoch: -1
+
+model:
+    model_name: 'FINTA'
+    finta:
+      input_size: 3
+      embedding_size: 32
+      hidden_dims: [32,64,128,256,512,1024]
+      streamline_length: 256
+
+loss:
+    name: 'MSELoss'
+    reduction: 'mean'
+
+logger:
+  tf_log: True
+  print_freq: 1
+
+

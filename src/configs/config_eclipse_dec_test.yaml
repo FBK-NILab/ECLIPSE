@@ -1,0 +1,69 @@
+checkpoint_path: 'checkpoints'
+img_path: 'imgs'
+mode: 'test'
+deterministic: y
+benchmark: n
+fixed_seed: y
+seed: 42
+continue_train: y
+print_summary: y
+save_epoch_freq: 10
+val_freq: 5
+epochs: 300
+device_ids: [0]
+which_epoch: 'best'
+
+data:
+    name: 'BilGin'
+    base_path: '/home/nilab/data/Extractor_merged'
+    streamline_number: 10000
+    padding: n
+    plausible_only: y
+    max_streamline_length: 256  # It is actually 250, but we chose 256 to uniform with the version of FINTA with resampling
+    return_geometric: y
+    rescale: n
+
+dataloader:
+    batch_size: 1
+    pin_memory: y
+    drop_last: n
+    shuffle_train: y
+    num_workers: 2
+    timeout: 0
+    persistent_workers: y
+    prefetch_factor: 2
+
+optimizer:
+    name: 'adamw'
+    lr: 0.1  # learning rate used in the paper of FINTA
+    weight_decay: 0.0005
+    fused: n
+
+scheduler:
+    name: 'step'
+    min_lr: 0.000668
+    step:
+      step_size: 10
+      gamma: 0.7
+
+model:
+    model_name: 'ECLIPSE'
+    eclipse:
+      input_size: 3
+      hidden_dims_ec: [64,64,64] # first hidden dim will be added in the code (input_size * 2)
+      hidden_dims_dec: [128] # first hidden dim will be added in the code (hidden_dims_ec[-1] * 2)
+      embedding_size: 32
+      k: 5
+      use_dynamic: True
+      aggr: 'max'
+      batch_norm: y
+      activation: 'relu'
+loss:
+    name: 'MSELoss'
+    reduction: 'mean'
+
+logger:
+  tf_log: True
+  print_freq: 10
+
+
