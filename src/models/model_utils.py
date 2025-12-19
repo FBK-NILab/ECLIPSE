@@ -106,7 +106,7 @@ def get_model(cfg:dict) -> Tuple[torch.nn.Module, Optional[List]]:
     elif model_name == 'ECLIPSE':
         activation_name = model_config.pop('activation', 'relu')
         activation = None if activation_name == '' else get_activation(activation_name)
-        model = GNNAutoencoder(
+        model = ECLIPSE(
             activation=activation,
             **model_config
         ).to(get_rank())
