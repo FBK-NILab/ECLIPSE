@@ -1,6 +1,9 @@
 # Edge-Convolution Latent Inference for Brain Tractography Embedding
 
 This repository is the official implementation of "Edge-Convolution Latent Inference for Brain Tractography Embedding", currently under review
+Checkpoints released on [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17981408.svg)](https://doi.org/10.5281/zenodo.17981408)
+
+
 
 ## Overview
 
