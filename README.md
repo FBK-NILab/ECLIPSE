@@ -55,7 +55,21 @@ N.B. When testing, the experiment name is used to load the checkpoint. If no exp
 The code was executed on a Linux-based system with CUDA 12.x (GPU: Ampere A40)
 
 ## Paper
-Citation will be provided upon acceptance
+The paper associated with this repository can be read at: [https://doi.org/10.1007/978-3-032-39379-1_24](url)
+
+If you use this model, please cite the following paper:
+
+Kostadinov, S., Ardino, P., Coletta, L., Zigiotto, L., Sarubbo, S., Petit, L., & Avesani, P. (2026, August). Edge-Convolution Latent Inference for Brain Tractography Embedding. In International Conference on Pattern Recognition (pp. 335-349). Cham: Springer Nature Switzerland.
+
+@inproceedings{kostadinov2026edge,
+  title={Edge-Convolution Latent Inference for Brain Tractography Embedding},
+  author={Kostadinov, Samuel and Ardino, Pierfrancesco and Coletta, Ludovico and Zigiotto, Luca and Sarubbo, Silvio and Petit, Laurent and Avesani, Paolo},
+  booktitle={International Conference on Pattern Recognition},
+  pages={335--349},
+  year={2026},
+  organization={Springer}
+}
+
 
 ## References
 
