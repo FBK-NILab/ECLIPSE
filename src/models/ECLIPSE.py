@@ -22,7 +22,7 @@ class ECLIPSE(torch.nn.Module):
     def __init__(self, input_size, k=5, aggr='max', embedding_size=32, hidden_dims_ec=None,
                  hidden_dims_dec=None, batch_norm=True, activation=None, use_dynamic=True, **kwargs):
 
-        super(GNNAutoencoder, self).__init__()
+        super(ECLIPSE, self).__init__()
 
         if hidden_dims_ec is None:
             hidden_dims_ec = [64, 64, 64]  # defaults for Verifyber encoder
