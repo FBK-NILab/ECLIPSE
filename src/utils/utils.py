@@ -1,327 +1,112 @@
-import os
-import random
-import shutil
-import logging
+import math
+from concurrent.futures import ThreadPoolExecutor
 
-from numba import njit, prange
-from scipy.spatial import KDTree
 import numpy as np
-from numpy.typing import NDArray
-import nibabel as nib
-
 import torch
-import torch.backends.cudnn as cudnn
+from torch_geometric.data import Data, Batch
+from tqdm import tqdm
+
+from ..models import get_model
 
 
-@njit(parallel=False, fastmath=True, cache=True)
-def parse_lengths_and_offsets(buffer_int32, nb_streamlines, point_size, n_properties):
-    lengths = np.empty(nb_streamlines, np.int32)
-    offsets = np.empty(nb_streamlines, np.int64)
+def get_edge_index(n_points):
+    idx = torch.arange(n_points - 1, dtype=torch.long)
+    top = torch.cat([idx, idx + 1])
+    bot = torch.cat([idx + 1, idx])
 
-    pointer = 0
-    for i in range(nb_streamlines):
-        l = buffer_int32[pointer]
-        lengths[i] = l
-        offsets[i] = pointer
-        pointer += 1 + l * point_size + n_properties
-
-    return lengths, offsets
+    return torch.stack([top, bot], dim=0).contiguous()
 
 
-@njit(parallel=True, fastmath=True, cache=True)
-def apply_affine_to_streamlines(streamlines, rotation, translation):
+def get_geometric_data(streamlines):
 
-    out = []
+    lines = [torch.as_tensor(line, dtype=torch.float32) for line in streamlines]
 
-    rotT = np.ascontiguousarray(rotation.T)
-    transT = np.ascontiguousarray(translation.T)
+    data_list = []
 
-    for i in prange(len(streamlines)):
-        s = streamlines[i]
-        s_c = np.ascontiguousarray(s)
-        s_aff = s_c @ rotT + transT
-        out.append(s_aff)
-    return out
+    for line in lines:
+        n_points = line.shape[0]
+        eidx = get_edge_index(n_points)
 
+        d = Data()
+        d.x = line
+        d.pos = line
+        d.edge_index = eidx
+        data_list.append(d)
 
-@njit(fastmath=True, cache=True)
-def compute_offsets_from_lengths(lengths, point_size, n_properties):
-
-    nb_streamlines = len(lengths)
-    offsets = np.empty(nb_streamlines, np.int64)
-    pos = 0
-    for i in range(nb_streamlines):
-        offsets[i] = pos
-        pos += 1 + lengths[i] * point_size + n_properties
-    return offsets
+    return data_list
 
 
+def check_embedding_params(chunk_dim, workers):
+    if chunk_dim < 1:
+        raise ValueError(f'chunk_dim must be a positive integer, got {chunk_dim}')
+    if workers is not None and workers < 1:
+        raise ValueError(f'workers must be a positive integer, got {workers}')
 
-@njit(parallel=True, fastmath=True, cache=True)
-def apply_affine_to_streamlines_batch(arr, rotation, translation):
+
+def check_streamlines(streamlines):
+    for i, line in enumerate(streamlines):
+        shape = np.shape(line)
+        if len(shape) != 2 or shape[1] != 3:
+            raise ValueError(f'Each streamline must have shape (n_points, 3), streamline {i} has shape {shape}')
+
+
+def load_model(checkpoint_path, use_gpu, cuda, verbose):
+    model_config = {
+        'input_size': 3,
+        'hidden_dims_ec': [64, 64, 64],
+        'hidden_dims_dec': [128],
+        'embedding_size': 32,
+        'aggr': 'max',
+        'batch_norm': True,
+        'activation': 'relu'
+    }
+    eclipse = get_model(model_config)
+
+    state_dict = torch.load(checkpoint_path, map_location='cpu')
+    eclipse.load_state_dict(state_dict['model'], strict=True)
+
+    eclipse.eval()
+    if use_gpu:
+        eclipse.to(f'cuda:{cuda}')
+
+    if verbose:
+        print('Model state dict loaded')
+
+    return eclipse
+
+
+@torch.no_grad()  # grad mode is thread-local, so it must be set here and not only in the caller
+def model_embed(eclipse, data_chunk, device):
+    batch = Batch.from_data_list(data_chunk).to(device)
+    return eclipse.embed(batch).cpu().numpy()
+
+
+@torch.no_grad()
+def embed_streamlines(eclipse, streamlines, chunk_dim=10000, verbose=False, workers=None):
+    """Embed a list of streamlines (each an (N_points, 3) array) with ECLIPSE.
+
+    Runs on the model's device. Chunks are embedded in parallel threads only when workers > 1 and the model is on CPU.
+    Returns an np.ndarray of shape (n_streamlines, embedding_size), in the same order as the input.
     """
-    arr: float32 (N, L, 3)
-    rotation: float32 (3,3)
-    translation: float32 (3,1) or (3,)
-    returns out: float32 (N, L, 3)
-    """
-    rotT = rotation.T
-    trans = translation.ravel()  # ravel translation for faster broadcast
-    out = np.empty_like(arr)
-    for i in prange(arr.shape[0]):
-        for j in range(arr.shape[1]):
-            out[i, j] = arr[i, j] @ rotT + trans
-    return out
+    n_streamlines = len(streamlines)
+    if n_streamlines == 0:
+        return np.empty((0, eclipse.embedding_size), dtype=np.float32)
 
+    device = next(eclipse.parameters()).device
+    geometric_data = get_geometric_data(streamlines)
+    chunks = math.ceil(n_streamlines / chunk_dim)
+    data_chunks = [geometric_data[i * chunk_dim:(i + 1) * chunk_dim] for i in range(chunks)]
+    desc = f'Embedding data chunks (each chunk is {chunk_dim} streamlines)'
 
-def precompile_numba_functions():
-
-    parse_lengths_and_offsets.compile("(int32[:], int64, int64, int64)")
-    compute_offsets_from_lengths.compile("(int32[:], int64, int64)")
-    apply_affine_to_streamlines_batch.compile("(float32[:, :, :], float32[:, :], float32[:, :])")
-
-
-def load_streamlines(trk_fn, idxs=None, apply_affine=True, container='list',
-                     replace=False, return_len=True, plausible_only=False, non_plausible_only=False, labels=None, mode='train'):
-
-    assert not (plausible_only and non_plausible_only), ("You can only specify either plausible only OR non plausible only, not both at the same time. "
-                                                         "If you want to use all streamlines, please set them both to false")
-
-    lazy_trk = nib.streamlines.load(trk_fn, lazy_load=True)
-    header = lazy_trk.header
-    nb_streamlines = header['nb_streamlines']
-    n_scalars = header['nb_scalars_per_point']
-    n_properties = header['nb_properties_per_streamline']
-    aff = nib.streamlines.trk.get_affine_trackvis_to_rasmm(header)
-
-    rotation = aff[:3, :3].astype(np.float32)
-    translation = aff[:3, 3:4].astype(np.float32)
-
-    point_size = 3 + n_scalars
-
-    if plausible_only:
-        assert labels is not None, 'The labels file is necessary to use only the plausible streamlines'
-
-    if labels is not None:
-        labels = np.load(labels)
-        positive_indices = np.where(labels == 1)[0]
-        negative_indices = np.where(labels == 0)[0]
-
-    if idxs is None:
-        if plausible_only:
-            idxs = positive_indices
-        elif non_plausible_only:
-            idxs = negative_indices[:len(positive_indices)]
-        else:
-            idxs = np.arange(nb_streamlines, dtype=np.int32)
-
-    elif isinstance(idxs, int):
-        if plausible_only:
-            if mode == 'train':
-                idxs = np.random.choice(positive_indices, size=idxs, replace=replace)
-            else:
-                idxs = positive_indices[:idxs]
-        elif non_plausible_only:
-            if mode == 'train':
-                idxs = np.random.choice(negative_indices, size=idxs, replace=replace)
-            else:
-                idxs = negative_indices[:idxs]
-        else:
-            if mode == 'train':
-                idxs = np.random.choice(np.arange(nb_streamlines), idxs, replace=replace)
-            else:
-                idxs = np.arange(min(idxs,nb_streamlines))
-
-    elif isinstance(idxs, list):
-        idxs = np.array(idxs, dtype=np.int32)
-
-    buffer = np.memmap(trk_fn, dtype='<f4', mode='r', offset=1000)  # after header
-    buffer_int32 = buffer.view(np.int32)
-
-    lengths, offsets = parse_lengths_and_offsets(buffer_int32, nb_streamlines, point_size, n_properties)
-
-    # Batch extraction to padded array
-    N = len(idxs)
-    lens = lengths[idxs]
-    if N == 0:
-        # edge case
-        if return_len:
-            return [], np.array([], dtype=np.int32)
-        else:
-            return []
-
-    max_len = int(lens.max())
-    arr = np.zeros((N, max_len, 3), dtype=np.float32)
-
-    # Extract streamlines into arr
-    for j, i in enumerate(idxs):
-        L = int(lens[j])
-        start = int(offsets[i] + 1)
-        n_floats = int(lengths[i] * point_size)
-        data = buffer[start:start + n_floats]
-        s = data.reshape(-1, point_size)[:, :3]
-        # s may be smaller than max_len along axis 0
-        arr[j, :L] = s
-
-    if apply_affine:
-        arr = apply_affine_to_streamlines_batch(arr, rotation, translation)
-
-    # Rebuild list of variable-length streamlines
-    streamlines = [arr[j, :int(lens[j])].copy() for j in range(N)]
-
-    if container == 'array':
-        streamlines = np.array(streamlines, dtype=object)
-    elif container == 'ArraySequence':
-        streamlines = nib.streamlines.ArraySequence(streamlines)
-    elif container == 'list':
-        pass
-    elif container == 'array_flat':
-        streamlines = np.concatenate(streamlines, axis=0)
-        return_len = True
+    parallel = workers is not None and workers > 1 and device.type == 'cpu'
+    if not parallel:
+        iterator = tqdm(data_chunks, desc=desc, dynamic_ncols=True) if verbose else data_chunks
+        embeddings = [model_embed(eclipse, chunk, device) for chunk in iterator]
     else:
-        raise Exception(f"Unknown container type: {container}")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = executor.map(lambda chunk: model_embed(eclipse, chunk, device), data_chunks)  # keeps the chunk order
+            if verbose:
+                results = tqdm(results, total=chunks, desc=desc, dynamic_ncols=True)
+            embeddings = list(results)
 
-    if return_len:
-        return streamlines, lengths[idxs]
-    else:
-        return streamlines
-
-
-def set_random_seed(seed: int) -> None:
-    r"""Set random seeds for everything.
-    Args:
-        seed (int): Random seed.
-    """
-    print(f"Using random seed {seed}")
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def init_cudnn(deterministic: bool, benchmark: bool) -> None:
-    r"""Initialize the cudnn module. The two things to consider is whether to
-    use cudnn benchmark and whether to use cudnn deterministic. If cudnn
-    benchmark is set, then the cudnn deterministic is automatically false.
-    Args:
-        deterministic (bool): Whether to use cudnn deterministic.
-        benchmark (bool): Whether to use cudnn benchmark.
-    """
-    cudnn.deterministic = deterministic
-    cudnn.benchmark = benchmark
-    print('cudnn benchmark: {}'.format(benchmark))
-    print('cudnn deterministic: {}'.format(deterministic))
-
-
-def translate_config(cfg: dict) -> dict:
-    for key in cfg:
-        if isinstance(cfg[key], dict):
-            cfg[key] = translate_config(cfg[key])
-        else:
-            if cfg[key] == 'n':
-                cfg[key] = False
-            elif cfg[key] == 'y':
-                cfg[key] = True
-            elif cfg[key] == 'None':
-                cfg[key] = None
-
-    return cfg
-
-
-def mkdirs(paths, overwrite: bool = False) -> None:
-    if isinstance(paths, list) and not isinstance(paths, str):
-        for path in paths:
-            mkdir(path, overwrite)
-    else:
-        mkdir(paths, overwrite)
-
-
-def mkdir(path, overwrite: bool = False) -> None:
-    if not os.path.exists(path):
-        os.makedirs(path)
-    else:
-        if overwrite:
-            print(f'Removing old folder {path}... ', end='')
-            shutil.rmtree(path)
-            print('Done')
-            print(f'Creating new folder {path}... ', end='')
-            os.makedirs(path)
-        else:
-            exit('This experiment already exists. Please rename the experiment.'
-                 ' The name of the experiment can be given through the flag --name (or -n)')
-
-
-def directed_hausdorff(A: NDArray[np.floating], B: NDArray[np.floating]) -> float:
-
-    treeB = KDTree(B)
-    dist, _ = treeB.query(A, k=1)
-
-    return float(np.max(dist))
-
-
-def hausdorff_mdf(A: NDArray[np.floating], B: NDArray[np.floating]) -> float:
-
-    direct = directed_hausdorff(A, B)
-    flipped = directed_hausdorff(A, B[::-1])
-
-    return min(direct, flipped)
-
-
-def directed_chamfer(A: NDArray[np.floating], B: NDArray[np.floating], squared: bool=True) -> float:
-
-    tree = KDTree(B)
-    distA_to_B, _ = tree.query(A, k=1)
-
-    if squared:
-        distA_to_B = distA_to_B ** 2
-
-    return float(np.mean(distA_to_B))
-
-
-def chamfer_mdf(A: NDArray[np.floating], B: NDArray[np.floating]) -> float:
-
-    direct = directed_chamfer(A, B, squared=False)
-    inverse = directed_chamfer(A, B[::-1], squared=False)
-
-    return float(min(direct, inverse))
-
-
-def reset_all_loggers():
-    """
-    Close and remove handles of registered loggers.
-    Reset the state of the logging system.
-    """
-    # Get the loggers
-    loggers = logging.Logger.manager.loggerDict
-
-    for name, logger in loggers.items():
-        if not isinstance(logger, logging.Logger):
-            continue
-
-        handlers = logger.handlers[:]
-        for h in handlers:
-            try:
-                h.flush()
-            except Exception:
-                pass
-            try:
-                h.close()
-            except Exception:
-                pass
-            logger.removeHandler(h)
-
-        logger.setLevel(logging.NOTSET)
-        logger.propagate = False
-
-    # Close the handlers
-    root_handlers = logging.getLogger().handlers[:]
-    for h in root_handlers:
-        try:
-            h.flush()
-        except Exception:
-            pass
-        logging.getLogger().removeHandler(h)
-
-    logging.shutdown()
-
+    return np.concatenate(embeddings, axis=0)

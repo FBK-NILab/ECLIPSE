@@ -1,0 +1,5 @@
+numpy~=2.2.6
+dipy~=1.11.0
+tqdm~=4.67.3
+torch~=2.8.0
+torch_geometric~=2.7.0
